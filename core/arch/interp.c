@@ -120,8 +120,8 @@ DECLARE_CXTSWPROT_VAR(mutex_t bb_building_lock, INIT_LOCK_FREE(bb_building_lock)
 /* i#1111: we do not use the lock until the 2nd thread is created */
 volatile bool bb_lock_start;
 
-#ifdef INTERNAL
-file_t bbdump_file = INVALID_FILE;
+#if defined(INTERNAL) || defined(DEBUG) || defined(CLIENT_INTERFACE)
+static file_t bbdump_file = INVALID_FILE;
 #endif
 
 #ifdef DEBUG
@@ -132,7 +132,7 @@ DECLARE_NEVERPROT_VAR(uint debug_bb_count, 0);
 void
 interp_init()
 {
-#ifdef INTERNAL
+#if defined(INTERNAL) || defined(DEBUG) || defined(CLIENT_INTERFACE)
     if (INTERNAL_OPTION(bbdump_tags)) {
         bbdump_file = open_log_file("bbs", NULL, 0);
         ASSERT(bbdump_file != INVALID_FILE);
@@ -151,7 +151,7 @@ static int num_rets_removed;
 void
 interp_exit()
 {
-#ifdef INTERNAL
+#if defined(INTERNAL) || defined(DEBUG) || defined(CLIENT_INTERFACE)
     if (INTERNAL_OPTION(bbdump_tags)) {
         close_log_file(bbdump_file);
     }
@@ -252,6 +252,14 @@ init_build_bb(build_bb_t *bb, app_pc start_pc, bool app_interp, bool for_cache,
               overlap_info_t *overlap_info)
 {
     memset(bb, 0, sizeof(*bb));
+#if defined(LINUX) && defined(X86_32)
+    /* With SA_RESTART (i#2659) we end up interpreting the int 0x80 in vsyscall,
+     * whose fall-through hits our hook.  We avoid interpreting our own hook
+     * by shifting it to the displaced pc.
+     */
+    if (start_pc == vsyscall_sysenter_return_pc)
+        start_pc = vsyscall_sysenter_displaced_pc;
+#endif
     bb->check_vm_area = true;
     bb->start_pc = start_pc;
     bb->app_interp = app_interp;
@@ -2907,6 +2915,13 @@ client_process_bb(dcontext_t *dcontext, build_bb_t *bb)
                       "block's app sources (instr_set_translation() targets) "
                       "must remain within original bounds");
 
+# ifdef AARCH64
+        if (instr_get_opcode(inst) == OP_isb) {
+            CLIENT_ASSERT(inst == instrlist_last(bb->ilist),
+                          "OP_isb must be last instruction in block");
+        }
+# endif
+
         /* PR 307284: we didn't process syscalls and ints pre-client
          * so do so now to get bb->flags and bb->exit_type set
          */
@@ -3211,22 +3226,6 @@ bb_safe_to_stop(dcontext_t *dcontext, instrlist_t *ilist, instr_t *stop_after)
     return true;
 }
 
-#ifdef X86
-/* Tells if instruction will trigger an exception because of debug register. */
-static bool
-debug_register_fire_on_addr(app_pc pc) {
-    size_t i;
-
-    for (i=0; i<DEBUG_REGISTERS_NB; i++) {
-        if (pc == debugRegister[i]) {
-            return true;
-        }
-    }
-
-    return false;
-}
-#endif
-
 /* Interprets the application's instructions until the end of a basic
  * block is found, and prepares the resulting instrlist for creation of
  * a fragment, but does not create the fragment, just returns the instrlist.
@@ -3512,10 +3511,10 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
 
 #ifdef X86
             /* If the next instruction at bb->cur_pc fires a debug register,
-             * then we should generate a single step exception before getting to it.
+             * then we should stop this basic block before getting to it.
              */
-            if (my_dcontext != NULL && debug_register_fire_on_addr(bb->cur_pc)) {
-                my_dcontext->single_step_addr = bb->instr_start;
+            if (my_dcontext != NULL && debug_register_fire_on_addr(bb->instr_start)) {
+                stop_bb_on_fallthrough = true;
                 break;
             }
 #endif
@@ -3920,6 +3919,11 @@ build_bb_ilist(dcontext_t *dcontext, build_bb_t *bb)
             if (!bb_process_interrupt(dcontext, bb))
                 break;
         }
+#ifdef AARCH64
+        /* OP_isb, when mangled, has a potential side exit. */
+        else if (instr_get_opcode(bb->instr) == OP_isb)
+            break;
+#endif
 #if 0/*i#1313, i#1314*/
         else if (instr_get_opcode(bb->instr) == OP_getsec) {
             /* XXX i#1313: if we support CPL0 in the future we'll need to
@@ -5234,7 +5238,7 @@ build_basic_block_fragment(dcontext_t *dcontext, app_pc start, uint initial_flag
             disassemble_fragment(dcontext, f, false);
         }
     });
-#ifdef INTERNAL
+#if defined(INTERNAL) || defined(DEBUG) || defined(CLIENT_INTERFACE)
     if (INTERNAL_OPTION(bbdump_tags)) {
         disassemble_fragment_header(dcontext, f, bbdump_file);
     }

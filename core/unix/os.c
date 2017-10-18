@@ -1466,6 +1466,8 @@ is_thread_tls_initialized(void)
     if (INTERNAL_OPTION(safe_read_tls_init)) {
         /* Avoid faults during early init or during exit when we have no handler.
          * It's not worth extending the handler as the faults are a perf hit anyway.
+         * For standalone_library, first_thread_tls_initialized will always be false,
+         * so we'll return false here and use our check in get_thread_private_dcontext().
          */
         if (!first_thread_tls_initialized || last_thread_tls_exited)
             return false;
@@ -1537,6 +1539,28 @@ is_thread_tls_initialized(void)
      */
     return true;
 #endif
+}
+
+bool
+is_DR_segment_reader_entry(app_pc pc)
+{
+    /* This routine is used to avoid problems with dr_prepopulate_cache() building
+     * bbs for DR code that reads DR segments when DR is a static library.
+     * It's a little ugly but it's not clear there's a better solution.
+     * See the discussion in i#2463 c#2.
+     */
+#ifdef X86
+    if (INTERNAL_OPTION(safe_read_tls_init)) {
+        return pc == (app_pc)safe_read_tls_magic ||
+            pc == (app_pc)safe_read_tls_self;
+    }
+#endif
+    /* XXX i#2463: for ARM and for -no_safe_read_tls_init it may be
+     * more complicated as the PC may not be a function entry but the
+     * start of a bb after a branch in our C code that uses inline asm
+     * to read the TLS.
+     */
+    return false;
 }
 
 #if defined(X86) || defined(DEBUG)
@@ -1925,7 +1949,7 @@ os_tls_init(void)
      * segments need to watch modify_ldt syscall
      */
     /* FIXME: heap_mmap marks as exec, we just want RW */
-    byte *segment = heap_mmap(PAGE_SIZE);
+    byte *segment = heap_mmap(PAGE_SIZE, VMM_SPECIAL_MMAP);
     os_local_state_t *os_tls = (os_local_state_t *) segment;
 
     LOG(GLOBAL, LOG_THREADS, 1, "os_tls_init for thread "TIDFMT"\n", get_thread_id());
@@ -2061,7 +2085,7 @@ os_tls_exit(local_state_t *local_state, bool other_thread)
         os_tls_thread_exit(local_state);
 
     /* We can't free prior to tls_thread_free() in case that routine refs os_tls */
-    heap_munmap(os_tls->self, PAGE_SIZE);
+    heap_munmap(os_tls->self, PAGE_SIZE, VMM_SPECIAL_MMAP);
 #else
     global_heap_free(tls_table, MAX_THREADS*sizeof(tls_slot_t) HEAPACCT(ACCT_OTHER));
     DELETE_LOCK(tls_lock);
@@ -2556,6 +2580,15 @@ os_process_under_dynamorio_initiate(dcontext_t *dcontext)
     /* We only support regular process-wide signal handlers for delayed takeover. */
     /* i#2161: we ignore alarm signals during the attach process to avoid races. */
     signal_reinstate_handlers(dcontext, true/*ignore alarm*/);
+    /* XXX: there's a tradeoff here: we have a race when we remove the hook
+     * because dr_app_stop() has no barrier and a thread sent native might
+     * resume from vsyscall after we remove the hook.  However, if we leave the
+     * hook, then the next takeover signal might hit a native thread that's
+     * inside DR just to go back native after having hit the hook.  For now we
+     * remove the hook and rely on translate_from_synchall_to_dispatch() moving
+     * threads from vsyscall to our gencode and not relying on the hook being
+     * present to finish up their go-native code.
+     */
     hook_vsyscall(dcontext, false);
 }
 
@@ -3187,7 +3220,7 @@ find_free_memory_in_region(byte *start, byte *end, size_t size,
             found = true;
             break;
         }
-        if (iter.vm_start >= end)
+        if (iter.vm_end >= end)
             break;
         last_end = iter.vm_end;
     }
@@ -3200,7 +3233,8 @@ os_heap_reserve_in_region(void *start, void *end, size_t size,
                           heap_error_code_t *error_code, bool executable)
 {
     byte *p = NULL;
-    byte *try_start = NULL;
+    byte *try_start = NULL, *try_end = NULL;
+    uint iters = 0;
 
     ASSERT(ALIGNED(start, PAGE_SIZE) && ALIGNED(end, PAGE_SIZE));
     ASSERT(ALIGNED(size, PAGE_SIZE));
@@ -3213,11 +3247,20 @@ os_heap_reserve_in_region(void *start, void *end, size_t size,
         return os_heap_reserve(NULL, size, error_code, executable);
 
     /* loop to handle races */
-    while (find_free_memory_in_region(start, end, size, &try_start, NULL)) {
-        p = os_heap_reserve(try_start, size, error_code, executable);
+#define RESERVE_IN_REGION_MAX_ITERS 128
+    while (find_free_memory_in_region(start, end, size, &try_start, &try_end)) {
+        /* If there's space we'd prefer the end, to avoid the common case of
+         * a large binary + heap at attach where we're likely to reserve
+         * right at the start of the brk: we'd prefer to leave more brk space.
+         */
+        p = os_heap_reserve(try_end - size, size, error_code, executable);
         if (p != NULL) {
             ASSERT(*error_code == HEAP_ERROR_SUCCESS);
             ASSERT(p >= (byte *)start && p + size <= (byte *)end);
+            break;
+        }
+        if (++iters > RESERVE_IN_REGION_MAX_ITERS) {
+            ASSERT_NOT_REACHED();
             break;
         }
     }
@@ -3656,6 +3699,7 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
     pre_second_thread();
     /* need to share signal handler table, prior to creating clone record */
     handle_clone(dcontext, flags);
+    ATOMIC_INC(int, uninit_thread_count);
     void *crec = create_clone_record(dcontext, (reg_t*)&xsp);
     /* make sure client_thread_run can get the func and arg, and that
      * signal_thread_inherit gets the right syscall info
@@ -4643,6 +4687,14 @@ is_readable_without_exception(const byte *pc, size_t size)
 bool
 is_readable_without_exception_query_os(byte *pc, size_t size)
 {
+    return is_readable_without_exception_internal(pc, size, true);
+}
+
+bool
+is_readable_without_exception_query_os_noblock(byte *pc, size_t size)
+{
+    if (memquery_from_os_will_block())
+        return false;
     return is_readable_without_exception_internal(pc, size, true);
 }
 
@@ -6933,6 +6985,7 @@ pre_system_call(dcontext_t *dcontext)
         if (is_thread_create_syscall(dcontext)) {
             create_clone_record(dcontext, sys_param_addr(dcontext, 1) /*newsp*/);
             os_clone_pre(dcontext);
+            ATOMIC_INC(int, uninit_thread_count);
         } else  /* This is really a fork. */
             os_fork_pre(dcontext);
         break;
@@ -6955,6 +7008,7 @@ pre_system_call(dcontext_t *dcontext)
         dcontext->sys_param1 = (reg_t) func_arg;
         *sys_param_addr(dcontext, 0) = (reg_t) new_bsdthread_intercept;
         *sys_param_addr(dcontext, 1) = (reg_t) clone_rec;
+        ATOMIC_INC(int, uninit_thread_count);
         break;
     }
     case SYS_posix_spawn: {
@@ -6987,6 +7041,7 @@ pre_system_call(dcontext_t *dcontext)
         create_clone_record(dcontext, (reg_t *)&mc->xsp /*child uses parent sp*/);
 # endif
         os_clone_pre(dcontext);
+        ATOMIC_INC(int, uninit_thread_count);
         break;
     }
 #endif
@@ -7628,6 +7683,11 @@ mmap_check_for_module_overlap(app_pc base, size_t size, bool readable, uint64 in
             ASSERT_CURIOSITY(inode == 0 /*see above comment*/||
                              module_contains_addr(ma, base+size-1));
         }
+        /* Handle cases like transparent huge pages where there are anon regions on top
+         * of the file mapping (i#2566).
+         */
+        if (ma->names.inode == 0)
+            ma->names.inode = inode;
         ASSERT_CURIOSITY(ma->names.inode == inode || inode == 0 /* for .bss */);
         DOCHECK(1, {
             if (readable && module_is_header(base, size)) {
@@ -8734,16 +8794,10 @@ get_application_base(void)
         /* Haven't done find_executable_vm_areas() yet so walk maps ourselves */
         const char *name = get_application_name();
         if (name != NULL && name[0] != '\0') {
-            memquery_iter_t iter;
-            memquery_iterator_start(&iter, NULL, false/*won't alloc*/);
-            while (memquery_iterator_next(&iter)) {
-                if (strcmp(iter.comment, name) == 0) {
-                    executable_start = iter.vm_start;
-                    executable_end = iter.vm_end;
-                    break;
-                }
-            }
-            memquery_iterator_stop(&iter);
+            DEBUG_DECLARE(int count =)
+                memquery_library_bounds(name, &executable_start, &executable_end,
+                                        NULL, 0);
+            ASSERT(count > 0 && executable_start != NULL);
         }
 #else
         /* We have to fail.  Should we dl_iterate this early? */
@@ -8980,7 +9034,10 @@ find_executable_vm_areas(void)
                 iter.vm_start, iter.vm_end, TEST(MEMPROT_EXEC, iter.prot) ? " +x": "",
                 iter.inode, iter.comment);
 #ifdef LINUX
-            ASSERT_CURIOSITY(iter.inode != 0); /* mapped images should have inodes */
+            /* Mapped images should have inodes, except for cases where an anon
+             * map is placed on top (i#2566)
+             */
+            ASSERT_CURIOSITY(iter.inode != 0 || iter.comment[0] == '\0');
 #endif
             ASSERT_CURIOSITY(iter.offset == 0); /* first map shouldn't have offset */
             /* Get size by walking the program headers.  This includes .bss. */
@@ -9002,6 +9059,10 @@ find_executable_vm_areas(void)
             exec_match = get_application_name();
             if (exec_match != NULL && exec_match[0] != '\0')
                 found_exec = (strcmp(iter.comment, exec_match) == 0);
+            /* Handle an anon region for the header (i#2566) */
+            if (!found_exec && executable_start != NULL &&
+                executable_start == iter.vm_start)
+                found_exec = true;
 #else
             /* We don't have a nice normalized name: it can have ./ or ../ inside
              * it.  But, we can distinguish an exe from a lib here, even for PIE,
@@ -9676,6 +9737,15 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
     uint num_threads;
     thread_id_t *tids;
     uint threads_to_signal = 0;
+
+    /* We do not want to re-takeover a thread that's in between notifying us on
+     * the last call to this routine and getting onto the all_threads list as
+     * we'll self-interpret our own code leading to a lot of problems.
+     * XXX: should we use an event to avoid this inefficient loop?  We expect
+     * this to only happen in rare cases during attach when threads are in flux.
+     */
+    while (uninit_thread_count > 0) /* relying on volatile */
+        os_thread_yield();
 
     mutex_lock(&thread_initexit_lock);
     CLIENT_ASSERT(thread_takeover_records == NULL,

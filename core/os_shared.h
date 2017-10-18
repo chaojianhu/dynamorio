@@ -341,6 +341,7 @@ enum {
     DUMPCORE_APP_EXCEPTION      = 0x40000,
     DUMPCORE_TRY_EXCEPT         = 0x80000, /* even when we do have a handler */
     DUMPCORE_UNSUPPORTED_APP    = 0x100000,
+    DUMPCORE_STACK_OVERFLOW     = 0x200000, /* modifies DUMPCORE_INTERNAL_EXCEPTION */
 
 #ifdef UNIX
     DUMPCORE_OPTION_PAUSE       = DUMPCORE_WAIT_FOR_DEBUGGER  |
@@ -561,6 +562,7 @@ bool get_stack_bounds(dcontext_t *dcontext, byte **base, byte **top);
 
 bool is_readable_without_exception(const byte *pc, size_t size);
 bool is_readable_without_exception_query_os(byte *pc, size_t size);
+bool is_readable_without_exception_query_os_noblock(byte *pc, size_t size);
 bool safe_read(const void *base, size_t size, void *out_buf);
 bool safe_read_ex(const void *base, size_t size, void *out_buf, size_t *bytes_read);
 bool safe_write_ex(void *base, size_t size, const void *in_buf, size_t *bytes_written);

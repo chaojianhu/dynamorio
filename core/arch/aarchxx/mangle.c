@@ -222,8 +222,8 @@ insert_clear_eflags(dcontext_t *dcontext, clean_call_info_t *cci,
 # ifdef AARCH64
 /* Creates a memory reference for registers saved/restored to memory. */
 static opnd_t
-create_base_disp_for_save_restore(uint base_reg, uint first_reg, uint reg,
-                                  bool is_single_reg, bool is_gpr)
+create_base_disp_for_save_restore(uint base_reg, bool is_single_reg, bool is_gpr,
+                                  uint num_saved)
 {
     /* opzs depends on the kind of register and whether a single register or
      * a pair of registers is saved/restored using stp/ldp.
@@ -241,7 +241,7 @@ create_base_disp_for_save_restore(uint base_reg, uint first_reg, uint reg,
             opsz = OPSZ_32;
     }
 
-    uint offset = is_gpr ? REG_OFFSET(DR_REG_X0 + reg) : reg * sizeof(dr_simd_t);
+    uint offset = num_saved * (is_gpr ? sizeof(reg_t) : sizeof(dr_simd_t));
     return opnd_create_base_disp(base_reg, DR_REG_NULL, 0, offset, opsz);
 }
 
@@ -256,6 +256,7 @@ insert_save_or_restore_registers(dcontext_t *dcontext, instrlist_t *ilist, instr
                                  bool save, bool is_gpr)
 {
     uint i, reg1 = UINT_MAX, num_regs = is_gpr ? 30 : 32;
+    uint saved_regs = 0;
     instr_t *new_instr;
     /* Use stp/ldp to save/restore as many register pairs to memory, skipping
      * registers according to reg_skip.
@@ -267,9 +268,9 @@ insert_save_or_restore_registers(dcontext_t *dcontext, instrlist_t *ilist, instr
         if (reg1 == UINT_MAX)
             reg1 = i;
         else {
-            opnd_t mem = create_base_disp_for_save_restore(base_reg, first_reg, reg1,
+            opnd_t mem = create_base_disp_for_save_restore(base_reg,
                                                            false /* is_single_reg */,
-                                                           is_gpr);
+                                                           is_gpr, saved_regs);
             if (save) {
                 new_instr = INSTR_CREATE_stp(dcontext, mem,
                                              opnd_create_reg(first_reg + reg1),
@@ -280,6 +281,7 @@ insert_save_or_restore_registers(dcontext_t *dcontext, instrlist_t *ilist, instr
             }
             PRE(ilist, instr, new_instr);
             reg1 = UINT_MAX;
+            saved_regs += 2;
         }
     }
 
@@ -287,9 +289,9 @@ insert_save_or_restore_registers(dcontext_t *dcontext, instrlist_t *ilist, instr
      * of registers to save/restore is odd.
      */
     if (reg1 != UINT_MAX) {
-        opnd_t mem = create_base_disp_for_save_restore(base_reg, first_reg, reg1,
+        opnd_t mem = create_base_disp_for_save_restore(base_reg,
                                                        true /* is_single_reg */,
-                                                       is_gpr);
+                                                       is_gpr, saved_regs);
         if (save) {
             new_instr = INSTR_CREATE_str(dcontext, mem,
                                          opnd_create_reg(first_reg + reg1));
@@ -346,6 +348,8 @@ insert_push_all_registers(dcontext_t *dcontext, clean_call_info_t *cci,
     }
     /* FIXME i#1551: once we have cci->num_simd_skip, skip this if possible */
 # ifdef AARCH64
+    /* X0 is used to hold the stack pointer. */
+    cci->reg_skip[DR_REG_X0 - DR_REG_START_GPR] = false;
     /* X1 and X2 are used to save and restore the status and control registers. */
     cci->reg_skip[DR_REG_X1 - DR_REG_START_GPR] = false;
     cci->reg_skip[DR_REG_X2 - DR_REG_START_GPR] = false;
@@ -931,7 +935,7 @@ insert_reachable_cti(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
 
 int
 insert_out_of_line_context_switch(dcontext_t *dcontext, instrlist_t *ilist,
-                                  instr_t *instr, bool save)
+                                  instr_t *instr, bool save, byte *encode_pc)
 {
 # ifdef AARCH64
     if (save) {
@@ -1153,7 +1157,9 @@ reinstate_it_blocks(dcontext_t *dcontext, instrlist_t *ilist, instr_t *start,
                 else
                     block_pred[block_count++] = instr_get_predicate(instr);
             }
-            if (!matches || !instr_predicated || block_count == IT_BLOCK_MAX_INSTRS) {
+            if (!matches || !instr_predicated || block_count == IT_BLOCK_MAX_INSTRS ||
+                /* i#1702: a cti must end the IT-block */
+                instr_is_cti(instr)) {
                 res++;
                 instrlist_preinsert
                     (ilist, block_start, INSTR_XL8(instr_it_block_create
@@ -1348,15 +1354,6 @@ mangle_syscall_arch(dcontext_t *dcontext, instrlist_t *ilist, uint flags,
      * mechanism) before the system call, and restore it afterwards.
      */
     ASSERT(DR_REG_STOLEN_MIN > DR_REG_SYSNUM);
-
-    /* We have to save r0 in case the syscall is interrupted.  To restart
-     * it, we need to replace the kernel's -EINTR in r0 with the original
-     * app arg.
-     * XXX optimization: we could try to get the syscall number and avoid
-     * this for non-auto-restart syscalls.
-     */
-    PRE(ilist, instr,
-        instr_create_save_to_tls(dcontext, DR_REG_R0, TLS_REG0_SLOT));
 }
 
 # ifdef UNIX

@@ -117,18 +117,20 @@ set(vmap_run_list
   "X86::-prof_pcs -thread_private"                 # i#1884: ARM thread_private NYI
   "X86::LIN::ONLY::^common::-code_api -no_early_inject" # ARM only supports early
   "DEBUG::ONLY::^common::-code_api -loglevel 1"
-  "ONLY::^common::-code_api -stack_size 120k"
+  "ONLY::^common::-code_api -stack_size 128k"
   "WIN::ONLY::^(runall|client)::-enable_full_api"
-  "DEBUG::WIN::ONLY::^(common|client)::-code_api -stack_size 120K -loglevel 1 -no_hide"
-  "DEBUG::LIN::ONLY::^(common|client)::-code_api -stack_size 120K -loglevel 1"
+  "DEBUG::WIN::ONLY::^(common|client)::-code_api -stack_size 128K -loglevel 1 -no_hide"
+  "DEBUG::LIN::ONLY::^(common|client)::-code_api -stack_size 128K -loglevel 1"
   "ONLY::^common::"
   "X86::LIN::ONLY::^${osname}::-code_api -sysenter_is_int80"
+  "X86::LIN::ONLY::^${osname}.sig::-max_pending_signals 1"
 
   # cover -tracedump_* options, just a couple combinations
   # XXX: how up time limit?  Used to have TEST_MINS=5 for tracedump runs.
   "ONLY::^common::-code_api -tracedump_text -tracedump_origins"
   "ONLY::^common::-code_api -tracedump_text -tracedump_origins -syntax_intel"
   "X86::ONLY::^common::-code_api -thread_private -tracedump_binary" # i#1884: ARM NYI
+  "ONLY::^common::-code_api -bbdump_tags"
 
   # make sure we at least sometimes exercise non-default -checklevel
   "DEBUG::ONLY::^common::-checklevel 4"
@@ -466,6 +468,12 @@ function (set_cflags source)
   get_filename_component(abs ${source} ABSOLUTE)
   file(READ ${abs} srccode)
   set(srccode "${srccode}" PARENT_SCOPE)
+  if (WIN32 AND "${srccode}" MATCHES "condvar\\.h")
+    # Ensure the ConditionVariable routines are pulled in when using >VS2010.
+    # Because dr_api.h includes windows.h and must be included before tools.h we do
+    # this via command line flags.
+    set(cflags "${cflags} -D_WIN32_WINNT=0x0600")
+  endif ()
   # We support a test either getting defines from configure.h or
   # needing them passed in on cmd line.
   if ("${srccode}" MATCHES "tools\\.h" OR
@@ -1514,6 +1522,8 @@ endfunction(optimize)
 message(STATUS "Processing tests and generating expected output patterns")
 
 tobuild(common.broadfun common/broadfun.c)
+# Make sure we test running a path with spaces (to avoid regressions like i#2538).
+set_target_properties(common.broadfun PROPERTIES OUTPUT_NAME "common.broadfun spaces")
 if (DEBUG)
   torunonly(common.logstderr common.broadfun common/logstderr.c
     "-log_to_stderr -loglevel 1 -logmask 2" "")
@@ -1677,6 +1687,11 @@ if (CLIENT_INTERFACE)
     tobuild_ci(client.abort client-interface/abort.c "" "" "")
   endif (X86)
   tobuild_ci(client.crashmsg client-interface/crashmsg.c "" "" "")
+  if (UNIX) # XXX i#2595: NYI on Windows
+    tobuild_ci(client.stack-overflow client-interface/stack-overflow.c ""
+      # To avoid flakiness on different systems we nail down the stack size:
+      "-stack_size 64K" "")
+  endif ()
   # FIXME i#1360: implement Mach-O export iterator
   # FIXME i#2008: fix bugs on Android
   if (NOT MACOS AND NOT ANDROID)
@@ -1903,6 +1918,7 @@ if (CLIENT_INTERFACE)
     endif (X86 OR AARCH64)
     if (X86) # FIXME i#1551, i#1569: port asm to ARM and AArch64
       tobuild_ci(client.signal client-interface/signal.c "" "" "")
+      target_link_libraries(client.signal ${libpthread})
       tobuild_ci(client.cbr-retarget client-interface/cbr-retarget.c "" "" "")
     endif (X86)
   else (UNIX)
@@ -2017,6 +2033,15 @@ if (CLIENT_INTERFACE)
   endif ()
   target_include_directories(client.drx_buf-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/client-interface)
+
+  if (ARM)
+    tobuild_ci(client.predicate-test client-interface/predicate-test.c "" "" "")
+    use_DynamoRIO_extension(client.predicate-test.dll drmgr)
+    use_DynamoRIO_extension(client.predicate-test.dll drutil)
+    use_DynamoRIO_extension(client.predicate-test.dll drreg)
+    target_include_directories(client.predicate-test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/client-interface)
+  endif (ARM)
 
   tobuild_ci(client.drreg-test client-interface/drreg-test.c "" "" "")
   use_DynamoRIO_extension(client.drreg-test.dll drmgr)
@@ -2140,6 +2165,12 @@ if (CLIENT_INTERFACE)
     set(client.pcache-use_depends client.pcache)
   endif (X86)
 
+  if (ARM AND NOT ANDROID)
+    # i#2580: DT_RUNPATH is not yet supported on android so we disable this test on
+    # android
+    tobuild_api(api.it api/it_arm.c "" "" OFF OFF)
+  endif(ARM AND NOT ANDROID)
+
   if (ARM)
     set(sfx "arm")
   elseif (AARCH64)
@@ -2185,6 +2216,7 @@ if (CLIENT_INTERFACE)
     add_api_exe(api.dis-a64 api/dis-a64.c OFF OFF)
     torunonly_api(api.dis-a64 api.dis-a64 api/dis-a64.c ""
       "-q;${CMAKE_CURRENT_SOURCE_DIR}/api/dis-a64.txt" OFF)
+    add_api_exe(api.reenc-a64 api/reenc-a64.c OFF OFF)
   elseif (X86)
     tobuild_api(api.dis api/dis.c "-syntax_intel"
       "${CMAKE_CURRENT_SOURCE_DIR}/api/dis-udis86-randtest.raw" OFF OFF)
@@ -2203,6 +2235,10 @@ if (CLIENT_INTERFACE)
     tobuild_api(api.detach api/detach.c "" "" OFF OFF)
     if (NOT ANDROID) # pthreads is inside Bionic on Android
       target_link_libraries(api.detach ${libpthread})
+    endif ()
+    tobuild_api(api.detach_spawn api/detach_spawn.c "" "" OFF OFF)
+    if (NOT ANDROID) # pthreads is inside Bionic on Android
+      target_link_libraries(api.detach_spawn ${libpthread})
     endif ()
   endif ()
   # test static decoder library
@@ -2245,6 +2281,8 @@ if (CLIENT_INTERFACE)
     target_link_libraries(api.static_noinit ${libmath})
     tobuild_api(api.static_detach api/static_detach.c "" "" OFF ON)
     target_link_libraries(api.static_detach ${libmath})
+    tobuild_api(api.static_prepop api/static_prepop.c "" "" OFF ON)
+    target_link_libraries(api.static_prepop ${libmath})
     if (NOT WIN32)
       tobuild_api(api.static_signal api/static_signal.c "" "" OFF ON)
       target_link_libraries(api.static_signal ${libmath} ${libpthread})
@@ -2266,6 +2304,10 @@ if (CLIENT_INTERFACE)
       "" "-thread_private -cache_bb_unit_init 4K" "")
   endif ()
 
+  if (X86) # Tests x86 reachability.
+    tobuild_ci(client.reachability client-interface/reachability.c "" "" "")
+  endif ()
+
   if (X86) # FIXME i#1551, i#1569: fix bugs on ARM and AArch64
     tobuild_ci(client.nudge_ex client-interface/nudge_ex.c "" "" "")
     use_DynamoRIO_extension(client.nudge_ex.dll drmgr)
@@ -2274,6 +2316,10 @@ if (CLIENT_INTERFACE)
   if (X86) # FIXME i#1551, i#1569: port asm to ARM and AArch64
     tobuild_ci(client.retaddr client-interface/retaddr.c "" "" "")
   endif (X86)
+
+  if (X86 AND WIN32) # FIXME port test application to other systems
+    tobuild_ci(client.translate_sandbox client-interface/translate_sandbox.c "" "" "")
+  endif ()
 
   if (NOT ANDROID) # XXX i#1874: get working on Android
     tobuild_ci(client.destructor client-interface/destructor.cpp "" "" "")
@@ -2392,7 +2438,7 @@ if (CLIENT_INTERFACE)
 
       torunonly_ci(tool.drcachesim.filter ${ci_shared_app} drcachesim
         "drcachesim-filter-simple.c" # for templatex basename
-        "-ipc_name drtestfilter -L0_filter" "" "")
+        "-ipc_name ${IPC_PREFIX}drtestfilter -L0_filter" "" "")
         set(tool.drcachesim.filter_toolname "drcachesim")
         set(tool.drcachesim.filter_basedir
         "${PROJECT_SOURCE_DIR}/clients/drcachesim/tests")
@@ -2555,10 +2601,42 @@ if (CLIENT_INTERFACE)
         torunonly_drcacheoff(burst_replaceall tool.drcacheoff.burst_replaceall "" "")
         set(tool.drcacheoff.burst_replaceall_nodr ON)
 
+        if (X64 AND UNIX)
+          torunonly_drcacheoff(burst_noreach tool.drcacheoff.burst_noreach "" "")
+          set(tool.drcacheoff.burst_noreach_nodr ON)
+        endif ()
+        if (LINUX)
+          torunonly_drcacheoff(burst_maps tool.drcacheoff.burst_maps "" "")
+          set(tool.drcacheoff.burst_maps_nodr ON)
+        endif ()
+
         if (UNIX)
           # FIXME i#2040: this hits static client issues on Windows
           torunonly_drcacheoff(burst_threads tool.drcacheoff.burst_threads "" "")
           set(tool.drcacheoff.burst_threads_nodr ON)
+
+          if (X86 AND NOT APPPLE) # This test is x86-specific.
+            # Test that raw2trace doesn't do more IO than it should.
+            get_target_path_for_execution(raw2trace_io_path tool.drcacheoff.raw2trace_io)
+            prefix_cmd_if_necessary(raw2trace_io_path ON ${raw2trace_io_path})
+            macro (torunonly_raw2trace testname exetgt extra_ops app_args)
+              torunonly_ci(tool.raw2trace.${testname} ${exetgt} drcachesim
+                "raw2trace-${testname}.c" # for templatex basename
+                "-offline ${extra_ops}" "" "${app_args}")
+              set(tool.raw2trace.${testname}_toolname "drcachesim")
+              set(tool.raw2trace.${testname}_basedir
+                "${PROJECT_SOURCE_DIR}/clients/drcachesim/tests")
+              set(tool.raw2trace.${testname}_rawtemp ON) # no preprocessor
+              set(tool.raw2trace.${testname}_runcmp
+                "${CMAKE_CURRENT_SOURCE_DIR}/runmulti.cmake")
+              set(tool.raw2trace.${testname}_precmd
+                "foreach@${CMAKE_COMMAND}@-E@remove_directory@drmemtrace.${exetgt}.*.dir")
+              set(tool.raw2trace.${testname}_postcmd
+              "${raw2trace_io_path}@-indir@drmemtrace.${exetgt}.*.dir@-out@drraw2trace.${exetgt}.out")
+            endmacro()
+            # actual trace processing not important -- set a very small limit for speed
+            torunonly_raw2trace(simple ${ci_shared_app} "-max_trace_size 8K" "")
+          endif()
 
           # FIXME i#2099: the weak symbol is not supported not work on Windows
           torunonly_drcacheoff(burst_client tool.drcacheoff.burst_client "" "")
@@ -2585,7 +2663,7 @@ if (CLIENT_INTERFACE)
       set(tool.histogram.offline_postcmd
         "${drcachesim_path}@-indir@drmemtrace.${histo_app}.*.dir")
       set(tool.histogram.offline_postcmd2
-        "${histo_path}@-trace@drmemtrace.${histo_app}.*.dir/drmemtrace.trace")
+        "${histo_path}@-test_mode@-trace@drmemtrace.${histo_app}.*.dir/drmemtrace.trace")
 
       find_program(GZIP gzip "gzip compression utility")
       if (UNIX AND ZLIB_FOUND AND GZIP)
@@ -2609,7 +2687,7 @@ if (CLIENT_INTERFACE)
         set(tool.histogram.gzip_postcmd2
           "${GZIP}@drmemtrace.${histo_app}.*.dir/drmemtrace.trace")
         set(tool.histogram.gzip_postcmd3
-          "${histo_path}@-trace@drmemtrace.${histo_app}.*.dir/drmemtrace.trace.gz")
+          "${histo_path}@-test_mode@-trace@drmemtrace.${histo_app}.*.dir/drmemtrace.trace.gz")
       elseif (UNIX)
         message(STATUS "gzip or zlib not found: disabling tool.histogram.gzip test")
       endif ()
@@ -3269,7 +3347,8 @@ if (X64 AND NOT AARCH64) # FIXME i#1569: get working on AArch64
         "" "-native_exec_list foo.dll,bar.dll -opt_cleancall 3 -thread_private" "")
     endif (UNIX)
   endif (CLIENT_INTERFACE)
-
+  torunonly(low4GB security-common.selfmod security-common/selfmod.c
+    "-heap_in_lower_4GB" "")
 endif (X64 AND NOT AARCH64)
 
 tobuild("security-common.TestAllocWE" security-common/TestAllocWE.c)

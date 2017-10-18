@@ -221,6 +221,8 @@ DR_API
  * - A system call or interrupt instruction can only be added
  * if it satisfies the above constraints: i.e., if it is the final
  * instruction in the block and the only system call or interrupt.
+ * - Any AArch64 #OP_isb instruction must be the last instruction
+ * in its block.
  * - All IT blocks must be legal.  For example, application instructions
  * inside an IT block cannot be removed or added to without also
  * updating the OP_it instruction itself.  Clients can use
@@ -5025,7 +5027,8 @@ typedef enum {
     /** Skip saving any XMM or YMM registers that are never used as return values. */
     DR_CLEANCALL_NOSAVE_XMM_NONRET      = 0x0010,
     /**
-     * Requests that an indirect call be used to ensure reachability.
+     * Requests that an indirect call be used to ensure reachability, both for
+     * reaching the callee and for any out-of-line helper routine calls.
      * Only honored for 64-bit mode, where r11 will be used for the indirection.
      */
     DR_CLEANCALL_INDIRECT               = 0x0020,
@@ -5974,6 +5977,20 @@ DR_API
  */
 void
 dr_switch_to_dr_state_ex(void *drcontext, dr_state_flags_t flags);
+
+DR_API
+/**
+ * Intended to be called between dr_app_setup() and dr_app_start() to
+ * pre-create code cache fragments for each basic block address in the
+ * \p tags array.  This speeds up the subsequent attach when
+ * dr_app_start() is called.
+ * If any code in the passed-in tags array is not readable, it is up to the
+ * caller to handle any fault, as DR's own signal handlers are not enabled
+ * at this point.
+ * Returns whether successful.
+ */
+bool
+dr_prepopulate_cache(app_pc *tags, size_t tags_count);
 
 #ifdef CUSTOM_TRACES
 /* DR_API EXPORT BEGIN */
